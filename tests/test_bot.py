@@ -47,6 +47,7 @@ class TestGoMod:
         args.working_dir = repo_dir
         args.git_username = "unittest"
         args.git_email = "unit@test.org"
+        args.sync_mode = "replay"
         return args
 
     def test_update_and_commit(self, tmp_go_app_repo, monkeypatch):
@@ -151,6 +152,7 @@ class TestGoModNoVendor:
         args.working_dir = repo_dir
         args.git_username = "unittest"
         args.git_email = "unit@test.org"
+        args.sync_mode = "replay"
         return args
 
     def test_update_and_commit_without_vendor(self, tmp_go_app_repo, monkeypatch):

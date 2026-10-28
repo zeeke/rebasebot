@@ -296,12 +296,7 @@ def _parse_cli_arguments():
                 "--conflict-policy",
                 "--bot-emails",
                 "--exclude-commits",
-                "--pre-rebase-hook",
                 "--pre-carry-commit-hook",
-                "--post-rebase-hook",
-                "--pre-push-rebase-branch-hook",
-                "--pre-create-pr-hook",
-                "--update-go-modules",
                 "--always-run-hooks",
             )
             if getattr(args, option[2:].replace("-", "_"))

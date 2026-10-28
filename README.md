@@ -32,8 +32,10 @@ branch so PR CI tests upstream changes together with downstream carries. If the
 merge has conflicts, the bot publishes the unmerged upstream tip and creates or
 updates the PR with manual conflict-resolution instructions.
 
-Choose the default `replay` mode when you need carry filtering, bot-commit
-squashing, lifecycle hooks, Go module updates or ART cherry-picks. Merge mode
+Merge mode supports lifecycle hooks and `--update-go-modules`; see
+[Lifecycle hooks in merge mode](#lifecycle-hooks-in-merge-mode). Choose the
+default `replay` mode when you need carry filtering, bot-commit squashing,
+`--pre-carry-commit-hook`, `--always-run-hooks` or ART cherry-picks. Merge mode
 does not support these features or resolve conflicts automatically.
 
 ## Auth parameters
@@ -266,8 +268,28 @@ Some rebasebot arguments are available in lifecycle hook scripts as environment 
 - `REBASEBOT_WORKING_DIR`: Path to the repository working directory.
 - `REBASEBOT_GIT_USERNAME`: Committer username from `--git-username`.
 - `REBASEBOT_GIT_EMAIL`: Committer email from `--git-email`.
+- `REBASEBOT_SYNC_MODE`: Synchronization mode from `--sync-mode` (`replay` or `merge`).
 
 *Note: Remotes are always `source`, `dest`, and `rebase`. The local branch is called rebase.*
+
+### Lifecycle hooks in merge mode
+
+Without hooks, merge mode builds the merge commit from git objects and never checks out a working tree.
+When hooks are configured, the local `rebase` branch is checked out so scripts can inspect the tree and
+commit on top of it:
+
+- `--pre-rebase-hook`: Executed with `rebase` checked out on `dest/branch`. Commits made here become part of the merge's first parent.
+- `--post-rebase-hook`: Executed with `rebase` checked out on the merge commit. `--update-go-modules` runs here.
+- `--pre-push-rebase-branch-hook`: Executed before pushing, only when the sync branch needs to be updated.
+- `--pre-create-pr-hook`: Executed before creating the pull request. Commits made here are not pushed.
+
+`--pre-carry-commit-hook` is not supported, since merge mode does not carry commits.
+
+Hooks don't run when downstream already contains upstream. If the merge has conflicts, only
+`--pre-rebase-hook` runs, and the upstream tip is published for manual resolution as usual.
+
+Hook commits get new SHAs on every run. The bot does not push when the sync branch already contains
+the current upstream and downstream tips and has the same tree as the new result.
 
 ### Always run hooks
 

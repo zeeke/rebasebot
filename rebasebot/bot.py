@@ -969,6 +969,14 @@ def _prepare_replay_workdir(gitwd: git.Repo, source: GitHubBranch, rebase: GitHu
     logging.info("Fetching all branches from source")
     gitwd.remotes.source.fetch(refspec="refs/heads/*:refs/heads/*", update_head_ok=True, filter="blob:none")
 
+    _fetch_rebase_branch(gitwd, rebase)
+
+    # Reset the existing rebase branch to match the source branch
+    # or create a new rebase branch based on the source branch.
+    _checkout_rebase_head(gitwd, gitwd.commit(f"refs/remotes/source/{source.branch}").hexsha)
+
+
+def _fetch_rebase_branch(gitwd: git.Repo, rebase: GitHubBranch) -> None:
     logging.info("Checking for existing rebase branch %s in %s", rebase.branch, rebase.url)
 
     rebase_ref = gitwd.git.ls_remote("rebase", rebase.branch, heads=True)
@@ -976,9 +984,8 @@ def _prepare_replay_workdir(gitwd: git.Repo, source: GitHubBranch, rebase: GitHu
         logging.info("Fetching existing rebase branch")
         gitwd.remotes.rebase.fetch(rebase.branch)
 
-    # Reset the existing rebase branch to match the source branch
-    # or create a new rebase branch based on the source branch.
-    head_commit = gitwd.commit(f"refs/remotes/source/{source.branch}").hexsha
+
+def _checkout_rebase_head(gitwd: git.Repo, head_commit: str) -> None:
     if "rebase" in gitwd.heads:
         gitwd.heads.rebase.set_commit(head_commit)
     else:
@@ -1103,11 +1110,16 @@ def _sync_upstream(
     gh_app: github3.GitHub,
     notifier: SlackNotifier,
     prow_job: ProwJobContext,
+    hooks: lifecycle_hooks.LifecycleHooks,
     dry_run: bool,
     ignore_manual_label: bool,
     title_prefix: str,
 ) -> bool:
-    """Publish a clean merge, or the upstream tip when conflicts require manual resolution."""
+    """Publish a clean merge, or the upstream tip when conflicts require manual resolution.
+
+    Without lifecycle hooks the merge is built from git objects only. With hooks, the local
+    rebase branch is checked out so scripts can inspect the tree and commit on top of it.
+    """
     upstream = gitwd.commit(f"refs/remotes/source/{source.branch}").hexsha
     downstream = gitwd.commit(f"dest/{dest.branch}").hexsha
     logging.info("Upstream: %s; downstream: %s", upstream, downstream)
@@ -1124,17 +1136,27 @@ def _sync_upstream(
     if synchronized and not pr_available:
         logging.info("Downstream already contains upstream.")
         return True
-    if dry_run:
+    run_hooks = not synchronized and any(hooks.hooks.values())
+    if dry_run and not run_hooks:
         logging.info("Dry run: would sync upstream changes to %s. No push or PR update.", rebase.label)
         return True
 
+    # Commits added by PRE_REBASE hooks become part of the merge's first parent.
+    base = downstream
+    if run_hooks:
+        _checkout_rebase_head(gitwd, downstream)
+        hooks.execute_scripts_for_hook(hook=lifecycle_hooks.LifecycleHook.PRE_REBASE)
+        base = gitwd.head.commit.hexsha
+
     status, merged_tree, stderr = gitwd.git.merge_tree(
-        "--write-tree", downstream, upstream, with_extended_output=True, with_exceptions=False
+        "--write-tree", base, upstream, with_extended_output=True, with_exceptions=False
     )
     if status not in (0, 1):
         raise RepoException(f"Cannot check merge conflicts: {stderr}")
     has_conflicts = status == 1
     tree = merged_tree.splitlines()[0]
+    # The remaining hooks need a merge result to work on.
+    run_hooks = run_hooks and not has_conflicts
 
     remote_ref = f"refs/heads/{rebase.branch}"
     remote = gitwd.git.ls_remote("--heads", "rebase", remote_ref)
@@ -1150,7 +1172,7 @@ def _sync_upstream(
             existing = gitwd.commit(remote_sha)
         if (
             existing is not None
-            and [parent.hexsha for parent in existing.parents] == [downstream, upstream]
+            and [parent.hexsha for parent in existing.parents] == [base, upstream]
             and existing.tree.hexsha == tree
         ):
             published = remote_sha
@@ -1158,19 +1180,39 @@ def _sync_upstream(
             published = gitwd.git.commit_tree(
                 tree,
                 "-p",
-                downstream,
+                base,
                 "-p",
                 upstream,
                 "-m",
                 f"Merge upstream/{source.branch} into {dest.branch}",
             )
+        if run_hooks:
+            gitwd.git.reset("--hard", published)
+            hooks.execute_scripts_for_hook(hook=lifecycle_hooks.LifecycleHook.POST_REBASE)
+            published = gitwd.head.commit.hexsha
+            # Hook commits get new SHAs on every run; keep the remote branch if its content is unchanged.
+            if (
+                existing is not None
+                and existing.tree.hexsha == gitwd.head.commit.tree.hexsha
+                and gitwd.is_ancestor(downstream, remote_sha)
+                and gitwd.is_ancestor(upstream, remote_sha)
+            ):
+                published = remote_sha
+    if dry_run:
+        logging.info("Dry run: would sync upstream changes to %s. No push or PR update.", rebase.label)
+        return True
     if remote_sha != published:
+        if run_hooks:
+            hooks.execute_scripts_for_hook(hook=lifecycle_hooks.LifecycleHook.PRE_PUSH_REBASE_BRANCH)
+            published = gitwd.head.commit.hexsha
         gitwd.git.push(f"--force-with-lease={remote_ref}:{remote_sha}", "rebase", f"{published}:{remote_ref}")
         logging.info("Sync branch updated to %s.", published)
     else:
         logging.info("Sync branch already contains upstream changes; no push required.")
 
     if not pr_available:
+        if run_hooks:
+            hooks.execute_scripts_for_hook(hook=lifecycle_hooks.LifecycleHook.PRE_CREATE_PR)
         title = f"Sync upstream {source.branch} into {dest.branch}"
         if title_prefix:
             title = f"{title_prefix}: {title}"
@@ -1243,11 +1285,10 @@ def run(
         or conflict_policy != "auto"
         or bot_emails
         or exclude_commits
-        or any(hooks.hooks.values())
-        or update_go_modules
+        or hooks.hooks.get(lifecycle_hooks.LifecycleHook.PRE_CARRY_COMMIT)
         or always_run_hooks
     ):
-        logging.error("Merge mode does not support replay policies or lifecycle hooks.")
+        logging.error("Merge mode does not support replay policies, pre-carry-commit hooks or --always-run-hooks.")
         return False
     if sync_mode == "merge" and (dest.ns, dest.name, dest.branch) == (rebase.ns, rebase.name, rebase.branch):
         logging.error("Merge mode requires a sync branch separate from the downstream branch.")
@@ -1300,6 +1341,9 @@ def run(
         )
         if sync_mode == "replay":
             _prepare_replay_workdir(gitwd, source, rebase)
+        elif any(hooks.hooks.values()):
+            # Hook scripts may be stored on the rebase branch.
+            _fetch_rebase_branch(gitwd, rebase)
     except Exception as ex:
         logging.exception(
             "error initializing the git directory with remotes: ",
@@ -1318,6 +1362,13 @@ def run(
         )
         return False
 
+    try:
+        hooks.fetch_hook_scripts(gitwd=gitwd, github_app_provider=github_app_provider)
+    except Exception as ex:
+        logging.exception("error fetching lifecycle hook scripts")
+        notify_slack_error(notifier, f"Failed to fetch lifecycle hook scripts for `{dest.label}`", ex)
+        return False
+
     if sync_mode == "merge":
         try:
             return _sync_upstream(
@@ -1329,21 +1380,19 @@ def run(
                 gh_app=gh_app,
                 notifier=notifier,
                 prow_job=prow_job,
+                hooks=hooks,
                 dry_run=dry_run,
                 ignore_manual_label=ignore_manual_label,
                 title_prefix=title_prefix,
             )
+        except LifecycleHookScriptException as ex:
+            logging.error(manual_intervention_description)
+            notify_slack_error(notifier, manual_intervention_description, ex)
+            return False
         except Exception as ex:
             logging.exception("Failed to sync upstream into %s", dest.label)
             notify_slack_error(notifier, f"Failed to sync upstream into `{dest.label}`", ex)
             return False
-
-    try:
-        hooks.fetch_hook_scripts(gitwd=gitwd, github_app_provider=github_app_provider)
-    except Exception as ex:
-        logging.exception("error fetching lifecycle hook scripts")
-        notify_slack_error(notifier, f"Failed to fetch lifecycle hook scripts for `{dest.label}`", ex)
-        return False
 
     try:
         needs_rebase = _needs_rebase(gitwd, source, dest)

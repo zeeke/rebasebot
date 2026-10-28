@@ -258,6 +258,7 @@ def _setup_environment_variables(args):
     os.environ["REBASEBOT_WORKING_DIR"] = args.working_dir
     os.environ["REBASEBOT_GIT_USERNAME"] = args.git_username
     os.environ["REBASEBOT_GIT_EMAIL"] = args.git_email
+    os.environ["REBASEBOT_SYNC_MODE"] = args.sync_mode
 
 
 def run_source_repo_hook(args, github_app_wrapper, temp_script_dir):
@@ -298,6 +299,8 @@ class LifecycleHooks:
         self.hooks: dict[LifecycleHook, list[LifecycleHookScript]] = {}
         self.tmp_hook_scripts_dir = tmp_script_dir
         self.working_dir = args.working_dir if args is not None else None
+        if args is None:
+            return
 
         _setup_environment_variables(args)
 

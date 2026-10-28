@@ -6,7 +6,7 @@ import pytest
 import requests
 
 from rebasebot import bot
-from rebasebot.lifecycle_hooks import LifecycleHook
+from rebasebot.lifecycle_hooks import LifecycleHook, LifecycleHooks, LifecycleHookScript
 from rebasebot.pr_body import build_merge_pr_body
 from rebasebot.prow import ProwJobContext
 from tests.conftest import CommitBuilder
@@ -45,6 +45,29 @@ def merge_run(init_test_repositories, fake_github_provider, tmp_path, pr_creatio
     }
     create_pr.return_value = sync_pr(options)
     return options, create_pr, dest_repo
+
+
+@pytest.fixture
+def merge_hooks(merge_run, tmp_path):
+    """Replaces the mocked hooks with real scripts; returns a function attaching a script body to a hook."""
+    options, _, _ = merge_run
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    hooks = LifecycleHooks(tmp_script_dir=str(scripts), args=None)
+    hooks.working_dir = options["working_dir"]
+    options["hooks"] = hooks
+
+    def attach(hook, body):
+        script = scripts / f"{hook.value}-{len(hooks.hooks.get(hook, []))}.sh"
+        script.write_text(f"#!/bin/bash\nset -e\n{body}\n")
+        script.chmod(0o700)
+        hooks.attach_script_to_hook(hook, LifecycleHookScript(str(script)))
+
+    return attach
+
+
+def commit_file_script(name):
+    return f"echo {name} > {name} && git add {name} && git commit -q -m {name}"
 
 
 def sync_pr(options, *, manual=False, has_conflicts=False, number=1):
@@ -91,7 +114,6 @@ def test_publishes_merged_tree_and_reuses_pr_even_with_conflicts(merge_run, conf
     assert not repo.heads
     assert not Path(repo.git_dir, "MERGE_HEAD").exists()
     assert not repo.is_dirty(untracked_files=True)
-    options["hooks"].fetch_hook_scripts.assert_not_called()
     options["hooks"].execute_scripts_for_hook.assert_not_called()
     assert "summary" not in create_pr.call_args.kwargs
     assert create_pr.return_value.update.called is conflicts
@@ -343,10 +365,9 @@ def test_unrelated_histories_fail_before_publication(merge_run):
     create_pr.assert_not_called()
 
 
-@pytest.mark.parametrize("stage", list(LifecycleHook))
-def test_direct_merge_run_rejects_hooks(merge_run, stage):
+def test_direct_merge_run_rejects_pre_carry_commit_hooks(merge_run):
     options, create_pr, _ = merge_run
-    options["hooks"].hooks = {stage: [MagicMock()]}
+    options["hooks"].hooks = {LifecycleHook.PRE_CARRY_COMMIT: [MagicMock()]}
     assert not bot.run(**options)
     assert not Path(options["working_dir"]).exists()
     create_pr.assert_not_called()
@@ -433,3 +454,100 @@ def test_failed_initial_conflict_instructions_update_recovers_without_creating_a
     pr.update.assert_called_once()
     gh_app._post.assert_called_once()
     created.update.assert_called_once()
+
+
+def test_hooks_run_in_order_around_the_merge(merge_run, merge_hooks, tmp_path):
+    options, create_pr, _ = merge_run
+    upstream = CommitBuilder(options["source"]).update_file("test.go", "upstream").commit("upstream update")
+    downstream = git.Repo(options["dest"].url).head.commit
+    marker = tmp_path / "pre-create-pr"
+    merge_hooks(LifecycleHook.PRE_REBASE, commit_file_script("pre-rebase"))
+    merge_hooks(LifecycleHook.POST_REBASE, '[[ "$(git rev-list --parents -n1 HEAD | wc -w)" == 3 ]]')
+    merge_hooks(LifecycleHook.POST_REBASE, commit_file_script("post-rebase"))
+    merge_hooks(LifecycleHook.PRE_PUSH_REBASE_BRANCH, commit_file_script("pre-push"))
+    merge_hooks(LifecycleHook.PRE_CREATE_PR, f"touch {marker}")
+    assert bot.run(**options)
+
+    pre_push = git.Repo(options["rebase"].url).head.commit
+    post_rebase = pre_push.parents[0]
+    merge = post_rebase.parents[0]
+    pre_rebase = merge.parents[0]
+    assert [c.summary for c in (pre_push, post_rebase, pre_rebase)] == ["pre-push", "post-rebase", "pre-rebase"]
+    assert merge.parents == (pre_rebase, upstream)
+    assert pre_rebase.parents == (downstream,)
+    assert marker.exists()
+    create_pr.assert_called_once()
+
+
+def test_hooks_repeat_does_not_push(merge_run, merge_hooks, monkeypatch, tmp_path):
+    options, create_pr, dest_repo = merge_run
+    CommitBuilder(options["source"]).update_file("test.go", "upstream").commit("upstream update")
+    marker = tmp_path / "pre-push"
+    # A unique message makes every run's hook commit SHA differ while its tree stays the same.
+    merge_hooks(LifecycleHook.POST_REBASE, 'echo x > post && git add post && git commit -q -m "post $RANDOM$RANDOM"')
+    merge_hooks(LifecycleHook.PRE_PUSH_REBASE_BRANCH, f"touch {marker}")
+    assert bot.run(**options)
+    published = git.Repo(options["rebase"].url).head.commit
+    assert marker.exists()
+    marker.unlink()
+
+    dest_repo.pull_requests.return_value = [sync_pr(options)]
+    execute = git.Git.execute
+    commands = []
+
+    def record(self, command, *args, **kwargs):
+        commands.append(command)
+        return execute(self, command, *args, **kwargs)
+
+    monkeypatch.setattr(git.Git, "execute", record)
+    assert bot.run(**options)
+    assert not any(command[1] == "push" for command in commands)
+    assert git.Repo(options["rebase"].url).head.commit == published
+    assert not marker.exists()
+    create_pr.assert_called_once()
+
+
+def test_conflicts_skip_hooks_after_pre_rebase(merge_run, merge_hooks, tmp_path):
+    options, create_pr, _ = merge_run
+    CommitBuilder(options["dest"]).update_file("test.go", "downstream").commit("downstream conflict")
+    upstream = CommitBuilder(options["source"]).update_file("test.go", "upstream").commit("upstream update")
+    merge_hooks(LifecycleHook.PRE_REBASE, f"touch {tmp_path / 'pre-rebase'}")
+    for hook in (LifecycleHook.POST_REBASE, LifecycleHook.PRE_PUSH_REBASE_BRANCH, LifecycleHook.PRE_CREATE_PR):
+        merge_hooks(hook, f"touch {tmp_path / hook.value}")
+    assert bot.run(**options)
+    assert git.Repo(options["rebase"].url).head.commit == upstream
+    assert (tmp_path / "pre-rebase").exists()
+    for hook in (LifecycleHook.POST_REBASE, LifecycleHook.PRE_PUSH_REBASE_BRANCH, LifecycleHook.PRE_CREATE_PR):
+        assert not (tmp_path / hook.value).exists()
+    create_pr.assert_called_once()
+
+
+def test_hook_failure_stops_before_publication(merge_run, merge_hooks, caplog):
+    options, create_pr, _ = merge_run
+    CommitBuilder(options["source"]).update_file("test.go", "upstream").commit("upstream update")
+    merge_hooks(LifecycleHook.POST_REBASE, "exit 3")
+    assert not bot.run(**options)
+    assert "failed with exit code 3" in caplog.text
+    assert not git.Repo(options["rebase"].url).heads
+    create_pr.assert_not_called()
+
+
+def test_dry_run_runs_hooks_without_publishing(merge_run, merge_hooks, tmp_path):
+    options, create_pr, _ = merge_run
+    options["dry_run"] = True
+    CommitBuilder(options["source"]).update_file("test.go", "upstream").commit("upstream update")
+    merge_hooks(LifecycleHook.POST_REBASE, f"touch {tmp_path / 'post-rebase'}")
+    merge_hooks(LifecycleHook.PRE_PUSH_REBASE_BRANCH, f"touch {tmp_path / 'pre-push'}")
+    assert bot.run(**options)
+    assert (tmp_path / "post-rebase").exists()
+    assert not (tmp_path / "pre-push").exists()
+    assert not git.Repo(options["rebase"].url).heads
+    create_pr.assert_not_called()
+
+
+def test_hooks_do_not_run_when_downstream_contains_upstream(merge_run, merge_hooks, tmp_path):
+    options, create_pr, _ = merge_run
+    merge_hooks(LifecycleHook.PRE_REBASE, f"touch {tmp_path / 'pre-rebase'}")
+    assert bot.run(**options)
+    assert not (tmp_path / "pre-rebase").exists()
+    create_pr.assert_not_called()

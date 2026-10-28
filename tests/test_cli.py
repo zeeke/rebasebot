@@ -79,11 +79,6 @@ class TestCliArgParser:
             ("bot-emails", "bot@example.com"),
             ("exclude-commits", "abc123"),
             ("pre-carry-commit-hook", "hook.sh"),
-            ("pre-rebase-hook", "hook.sh"),
-            ("post-rebase-hook", "hook.sh"),
-            ("pre-push-rebase-branch-hook", "hook.sh"),
-            ("pre-create-pr-hook", "hook.sh"),
-            ("update-go-modules", None),
             ("always-run-hooks", None),
             ("tag-pol", "strict"),
         ],
@@ -99,6 +94,21 @@ class TestCliArgParser:
     def test_merge_accepts_minimal_configuration(self, valid_args_dict):
         valid_args_dict.pop("update-go-modules")
         with patch("sys.argv", ["rebasebot", *args_dict_to_list(valid_args_dict), "--sync-mode", "merge"]):
+            assert _parse_cli_arguments().sync_mode == "merge"
+
+    @pytest.mark.parametrize(
+        "option,value",
+        [
+            ("pre-rebase-hook", "hook.sh"),
+            ("post-rebase-hook", "hook.sh"),
+            ("pre-push-rebase-branch-hook", "hook.sh"),
+            ("pre-create-pr-hook", "hook.sh"),
+            ("update-go-modules", None),
+        ],
+    )
+    def test_merge_accepts_lifecycle_hooks(self, get_valid_cli_args, valid_args_dict, option, value):
+        valid_args_dict.pop("update-go-modules")
+        with patch("sys.argv", ["rebasebot", *get_valid_cli_args({"sync-mode": "merge", option: value})]):
             assert _parse_cli_arguments().sync_mode == "merge"
 
     @pytest.mark.parametrize(
