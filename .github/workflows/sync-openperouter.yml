@@ -1,0 +1,49 @@
+name: Sync OpenPerouter
+
+on:
+  schedule:
+    - cron: "23 6 * * *" # Daily at 06:23 UTC
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: openperouter-sync-main
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Run rebasebot
+        shell: bash
+        env:
+          APP_PRIVATE_KEY: ${{ secrets.REBASEBOT_APP_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$APP_PRIVATE_KEY" ]]; then
+            echo "::error::Set the REBASEBOT_APP_PRIVATE_KEY repository secret before running this workflow."
+            exit 1
+          fi
+
+          umask 077
+          key="$(mktemp "$RUNNER_TEMP/rebasebot-key.XXXXXX")"
+          trap 'rm -f "$key"' EXIT
+          printf '%s\n' "$APP_PRIVATE_KEY" > "$key"
+
+          docker run --rm --user root \
+            --mount "type=bind,src=$key,dst=/secrets/rebasebot/openshift-rebasebot-key,readonly" \
+            quay.io/apanatto/rebase-bot:pr-108-20261102 \
+            --source https://github.com/openperouter/openperouter:main \
+            --dest openshift-kni/openperouter:main \
+            --rebase openshift-kni/openperouter:merge-bot-sync-main \
+            --pre-push-rebase-branch-hook git:https://github.com/zeeke/openperouter/ds/rebase-bot-hooks:openshift/rebasebot/update_go_modules.sh \
+            --github-app-id 5439243 \
+            --github-app-key /secrets/rebasebot/openshift-rebasebot-key \
+            --github-cloner-id 5439243 \
+            --github-cloner-key /secrets/rebasebot/openshift-rebasebot-key \
+            --git-username "openperouter-rebasebot-placeholder[bot]" \
+            --git-email "346813417+openperouter-rebasebot-placeholder[bot]@users.noreply.github.com" \
+            --sync-mode merge
